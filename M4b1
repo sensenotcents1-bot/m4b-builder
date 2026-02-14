@@ -1,0 +1,528 @@
+import os
+import sys
+import time
+import json
+import shutil
+import subprocess
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# Optional mutagen
+try:
+    from mutagen.mp4 import MP4, MP4Cover
+    HAS_MUTAGEN = True
+except Exception:
+    HAS_MUTAGEN = False
+
+
+# ----------------------------
+# Persistent work folder
+# ----------------------------
+def get_work_root() -> Path:
+    root = Path.home() / "Documents" / "m4b_builder_work"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def make_run_dir(root: Path) -> Path:
+    run_dir = root / time.strftime("run_%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+# ----------------------------
+# Logging
+# ----------------------------
+class Logger:
+    def __init__(self, text_widget: tk.Text | None = None):
+        self.text = text_widget
+
+    def write(self, msg: str):
+        # Always write to console (PyCharm)
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+        # Also write to GUI
+        if self.text is not None:
+            self.text.configure(state="normal")
+            self.text.insert("end", msg)
+            self.text.see("end")
+            self.text.configure(state="disabled")
+            self.text.update_idletasks()
+
+
+# ----------------------------
+# FFmpeg helpers
+# ----------------------------
+def which_or_fail(exe: str):
+    from shutil import which
+    if which(exe) is None:
+        raise RuntimeError(f"Required executable not found on PATH: {exe}")
+
+def normalize_cover_to_jpeg(cover_path: Path, out_jpg: Path, log):
+    """
+    Convert any image (png/jpg/etc) into a "known good" JPEG:
+    - scaled to max width 1200 (keeps aspect)
+    - yuvj420p pixel format (widely compatible)
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(cover_path),
+        "-vf", "scale='min(1200,iw)':-2,format=yuvj420p",
+        "-q:v", "2",
+        str(out_jpg)
+    ]
+    run_cmd(cmd, log)
+
+def run_cmd(cmd: list[str], log, cwd: Path | None = None):
+    """
+    Runs a command, streaming stdout/stderr into `log.write(...)`.
+    Prints a Windows copy/paste-safe command string using list2cmdline().
+    """
+    printable = subprocess.list2cmdline(cmd)  # crucial for Windows quoting
+    log.write("\n>> " + printable + "\n")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    out_lines = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        out_lines.append(line)
+        log.write(line)
+
+    code = proc.wait()
+    if code != 0:
+        tail = "".join(out_lines[-80:])
+        raise RuntimeError(f"Command failed (exit {code}). Last output:\n{tail}")
+
+
+def ffprobe_json(path: Path) -> dict:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-print_format", "json", str(path)],
+        capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    return json.loads(proc.stdout)
+
+
+def duration_ms(path: Path) -> int:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(path)],
+        capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    sec = float(proc.stdout.strip())
+    return int(round(sec * 1000))
+
+
+def ensure_m4a(input_path: Path, out_dir: Path, log: Logger) -> Path:
+    """
+    Convert AAC to M4A container without re-encoding if possible.
+    If already .m4a/.mp4/.m4b, copy to out_dir.
+    """
+    ext = input_path.suffix.lower()
+    out_path = out_dir / (input_path.stem + ".m4a")
+
+    if ext in [".m4a", ".m4b", ".mp4"]:
+        # Copy into working dir as .m4a for consistency
+        shutil.copy2(input_path, out_path)
+        return out_path
+
+    # Most common: raw .aac -> wrap into m4a
+    # If ffmpeg can copy codec, do it.
+    cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(input_path), "-c:a", "copy", str(out_path)]
+    run_cmd(cmd, log)
+    return out_path
+
+
+def write_concat_list(m4a_files: list[Path], list_path: Path):
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in m4a_files:
+            path_str = str(p)
+            # Escape single quotes for ffmpeg concat file format
+            path_str = path_str.replace("'", r"'\''")
+            f.write(f"file '{path_str}'\n")
+
+
+def write_ffmetadata(ffmeta_path: Path, chapters: list[tuple[int, int, str]]):
+    """
+    chapters: list of (start_ms, end_ms, title)
+    """
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("\n", " ").replace("\r", " ")
+
+    with open(ffmeta_path, "w", encoding="utf-8") as f:
+        f.write(";FFMETADATA1\n")
+        for (start, end, title) in chapters:
+            f.write("[CHAPTER]\n")
+            f.write("TIMEBASE=1/1000\n")
+            f.write(f"START={start}\n")
+            f.write(f"END={end}\n")
+            f.write(f"title={esc(title)}\n")
+
+
+# ----------------------------
+# Build pipeline
+# ----------------------------
+def build_m4b(
+
+    chapter_files: list[Path],
+    cover_path: Path | None,
+    out_path: Path,
+    title: str,
+    author: str,
+    album: str,
+    year: str,
+    genre: str,
+    comment: str,
+    log: Logger,
+):
+    log.write("\n[debug] cover_path received: " + repr(cover_path) + "\n")
+
+    if cover_path is not None:
+        try:
+            log.write("[debug] cover exists: " + str(Path(cover_path).exists()) + "  path=" + str(cover_path) + "\n")
+        except Exception as e:
+            log.write("[debug] cover existence check failed: " + str(e) + "\n")
+    else:
+        log.write("[debug] cover_path is None (no cover will be attached)\n")
+    which_or_fail("ffmpeg")
+    which_or_fail("ffprobe")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Persistent run folder
+    run_dir = make_run_dir(get_work_root())
+    log.write(f"\nWorking folder:\n  {run_dir}\n")
+
+    parts_dir = run_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    # A) Normalize inputs to .m4a inside run dir
+    log.write("\n[A] Normalizing inputs to M4A...\n")
+    m4a_parts: list[Path] = []
+    for p in chapter_files:
+        m4a_parts.append(ensure_m4a(p, parts_dir, log))
+
+    # B) Concat losslessly
+    log.write("\n[B] Concatenating parts...\n")
+    concat_list = run_dir / "concat_list.txt"
+    write_concat_list(m4a_parts, concat_list)
+
+    concat_out = run_dir / "concat.m4a"
+    run_cmd(
+        ["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(concat_out)],
+        log
+    )
+
+    # C) Step 1: attach cover (stage1)
+    stage1 = run_dir / "stage1_cover.m4b"
+
+    if cover_path is not None:
+        if not cover_path.exists():
+            raise FileNotFoundError(f"Cover not found: {cover_path}")
+
+        # Normalize cover to a known-good JPEG inside the run folder
+        cover_norm = run_dir / "cover_norm.jpg"
+        log.write("\n[C] Normalizing cover image...\n")
+        normalize_cover_to_jpeg(cover_path, cover_norm, log)
+
+        log.write("\n[C] Attaching cover (stage1)...\n")
+        stage1 = run_dir / "stage1_cover.m4b"
+
+        cmd1 = [
+            "ffmpeg", "-nostdin", "-y",
+            "-i", str(concat_out),  # audio
+            "-i", str(cover_norm),  # normalized jpeg
+            "-map", "0:a:0",
+            "-map", "1:v:0",
+            "-c:a", "copy",
+            "-c:v", "mjpeg",
+            "-disposition:v:0", "attached_pic",
+            "-movflags", "+faststart+use_metadata_tags",
+            "-f", "ipod",  # KEY CHANGE
+            str(stage1)
+        ]
+        run_cmd(cmd1, log)
+
+    else:
+        log.write("\n[C] No cover selected; building audio-only stage1...\n")
+        cmd1 = [
+            "ffmpeg", "-nostdin", "-y",
+            "-i", str(concat_out),
+            "-map", "0:a:0",
+            "-c:a", "copy",
+            "-movflags", "+faststart+use_metadata_tags",
+            "-f", "mp4",
+            str(stage1)
+        ]
+
+    run_cmd(cmd1, log)
+
+
+
+    # D) Chapters from files
+    log.write("\n[D] Building chapter list...\n")
+    chapters: list[tuple[int, int, str]] = []
+    ms = 0
+    for src in m4a_parts:
+        d = duration_ms(src)
+        chapters.append((ms, ms + d, src.stem))
+        ms += d
+
+    ffmeta = run_dir / "ffmetadata.txt"
+    write_ffmetadata(ffmeta, chapters)
+
+    # E) Step 2: inject chapters + tags WITHOUT creating data streams
+    log.write("\n[E] Injecting chapters/metadata into final...\n")
+    cmd2 = [
+        "ffmpeg", "-nostdin", "-y",
+        "-i", str(stage1),       # 0 audio(+cover)
+        "-i", str(ffmeta),       # 1 metadata
+        "-map", "0",             # take audio + cover
+        "-map_metadata", "1",
+        "-map_chapters", "1",
+        "-c", "copy",
+        "-dn",                   # drop any data tracks, just in case
+        str(out_path)
+    ]
+    run_cmd(cmd2, log)
+
+    # F) Add global tags (Mutagen) — optional but helps some apps
+    log.write("\n[F] Writing tags (optional)...\n")
+    if HAS_MUTAGEN:
+        try:
+            m = MP4(str(out_path))
+            if title:  m["\xa9nam"] = [title]
+            if author:
+                m["\xa9ART"] = [author]
+                m["aART"] = [author]
+            if album:  m["\xa9alb"] = [album]
+            if year:   m["\xa9day"] = [str(year)]
+            if genre:  m["\xa9gen"] = [genre]
+            if comment:m["desc"] = [comment]
+            m["stik"] = [2]  # audiobook
+
+            if cover_path and cover_path.exists():
+                with open(cover_path, "rb") as imgf:
+                    data = imgf.read()
+                if cover_path.suffix.lower() in (".jpg", ".jpeg"):
+                    m["covr"] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_JPEG)]
+                elif cover_path.suffix.lower() == ".png":
+                    # Allowed, but some players ignore PNG; still write it.
+                    m["covr"] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_PNG)]
+                    log.write("Note: PNG cover embedded via covr; if some players ignore it, try JPEG.\n")
+                else:
+                    # Fallback: treat as jpeg bytes
+                    m["covr"] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_JPEG)]
+            m.save()
+        except Exception as e:
+            log.write(f"Warning: mutagen tag write failed: {e}\n")
+    else:
+        log.write("mutagen not installed; skipping MP4 tags. (pip install mutagen)\n")
+
+    # G) Final verify
+    log.write("\n[G] Verifying output streams...\n")
+    finfo = ffprobe_json(out_path)
+    streams = finfo.get("streams", [])
+    has_vid = any(s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic") == 1 for s in streams)
+    has_bin = any(s.get("codec_type") == "data" for s in streams)
+
+    log.write(f"Output: {out_path}\n")
+    log.write(f"Attached cover stream present: {has_vid}\n")
+    log.write(f"Data stream present (should be False): {has_bin}\n")
+    log.write("\nDone.\n")
+
+
+# ----------------------------
+# GUI
+# ----------------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("M4B Builder (Clean)")
+        self.geometry("900x650")
+
+        self.chapter_files: list[Path] = []
+        self.cover_path: Path | None = None
+        self.out_path: Path | None = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+
+        # Chapters list
+        left = ttk.LabelFrame(top, text="Chapters (in order)")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        self.listbox = tk.Listbox(left, height=10)
+        self.listbox.pack(fill="both", expand=True, padx=8, pady=8)
+
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Add files...", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="Remove selected", command=self.remove_selected).pack(side="left", padx=8)
+        ttk.Button(btns, text="Move up", command=lambda: self.move_sel(-1)).pack(side="left")
+        ttk.Button(btns, text="Move down", command=lambda: self.move_sel(1)).pack(side="left", padx=8)
+
+        # Right side: cover and output
+        right = ttk.Frame(top)
+        right.pack(side="right", fill="y")
+
+        cov = ttk.LabelFrame(right, text="Cover")
+        cov.pack(fill="x", pady=(0, 8))
+        self.cover_lbl = ttk.Label(cov, text="(none)")
+        self.cover_lbl.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Button(cov, text="Choose cover...", command=self.choose_cover).pack(padx=8, pady=(0, 8), fill="x")
+        ttk.Button(cov, text="Clear cover", command=self.clear_cover).pack(padx=8, pady=(0, 8), fill="x")
+
+        out = ttk.LabelFrame(right, text="Output")
+        out.pack(fill="x")
+        self.out_lbl = ttk.Label(out, text="(none)")
+        self.out_lbl.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Button(out, text="Choose output .m4b...", command=self.choose_output).pack(padx=8, pady=(0, 8), fill="x")
+
+        # Metadata
+        meta = ttk.LabelFrame(frm, text="Metadata")
+        meta.pack(fill="x", pady=10)
+
+        self.title_var = tk.StringVar()
+        self.author_var = tk.StringVar()
+        self.album_var = tk.StringVar()
+        self.year_var = tk.StringVar()
+        self.genre_var = tk.StringVar()
+        self.comment_var = tk.StringVar()
+
+        def row(label, var, r):
+            ttk.Label(meta, text=label).grid(row=r, column=0, sticky="e", padx=6, pady=4)
+            ttk.Entry(meta, textvariable=var).grid(row=r, column=1, sticky="we", padx=6, pady=4)
+
+        meta.columnconfigure(1, weight=1)
+        row("Title", self.title_var, 0)
+        row("Author/Artist", self.author_var, 1)
+        row("Album/Series", self.album_var, 2)
+        row("Year", self.year_var, 3)
+        row("Genre", self.genre_var, 4)
+        row("Comment", self.comment_var, 5)
+
+        # Build button
+        actions = ttk.Frame(frm)
+        actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(actions, text="Build M4B", command=self.on_build).pack(side="right")
+
+        # Log output
+        logf = ttk.LabelFrame(frm, text="Log")
+        logf.pack(fill="both", expand=True)
+        self.log_text = tk.Text(logf, height=12, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select chapter audio files",
+            filetypes=[("Audio", "*.aac *.m4a *.m4b *.mp4"), ("All files", "*.*")]
+        )
+        if not paths:
+            return
+        for p in paths:
+            self.chapter_files.append(Path(p))
+            self.listbox.insert("end", p)
+
+    def remove_selected(self):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        for i in reversed(sel):
+            self.listbox.delete(i)
+            del self.chapter_files[i]
+
+    def move_sel(self, delta: int):
+        sel = self.listbox.curselection()
+        if len(sel) != 1:
+            return
+        i = sel[0]
+        j = i + delta
+        if j < 0 or j >= len(self.chapter_files):
+            return
+        self.chapter_files[i], self.chapter_files[j] = self.chapter_files[j], self.chapter_files[i]
+        txt_i = self.listbox.get(i)
+        txt_j = self.listbox.get(j)
+        self.listbox.delete(i)
+        self.listbox.insert(i, txt_j)
+        self.listbox.delete(j)
+        self.listbox.insert(j, txt_i)
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(j)
+
+    def choose_cover(self):
+        p = filedialog.askopenfilename(
+            title="Select cover image (JPEG recommended)",
+            filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All files", "*.*")]
+        )
+        if not p:
+            return
+        self.cover_path = Path(p)
+        self.cover_lbl.configure(text=str(self.cover_path))
+
+    def clear_cover(self):
+        self.cover_path = None
+        self.cover_lbl.configure(text="(none)")
+
+    def choose_output(self):
+        p = filedialog.asksaveasfilename(
+            title="Save output M4B",
+            defaultextension=".m4b",
+            filetypes=[("M4B Audiobook", "*.m4b")]
+        )
+        if not p:
+            return
+        self.out_path = Path(p)
+        self.out_lbl.configure(text=str(self.out_path))
+
+    def on_build(self):
+        if not self.chapter_files:
+            messagebox.showerror("Missing chapters", "Add at least one chapter file.")
+            return
+        if self.out_path is None:
+            messagebox.showerror("Missing output", "Choose an output .m4b file.")
+            return
+        if self.cover_path is None:
+            messagebox.showerror("Missing cover",
+                                 "Choose a cover image (JPEG recommended) or click Clear Cover intentionally.")
+            return
+
+        log = Logger(self.log_text)
+        try:
+            build_m4b(
+
+            chapter_files=self.chapter_files,
+                cover_path=self.cover_path,
+                out_path=self.out_path,
+                title=self.title_var.get().strip(),
+                author=self.author_var.get().strip(),
+                album=self.album_var.get().strip(),
+                year=self.year_var.get().strip(),
+                genre=self.genre_var.get().strip(),
+                comment=self.comment_var.get().strip(),
+                log=log,
+            )
+            messagebox.showinfo("Success", f"Built:\n{self.out_path}")
+        except Exception as e:
+            messagebox.showerror("Build failed", str(e))
+
+
+if __name__ == "__main__":
+    App().mainloop()
